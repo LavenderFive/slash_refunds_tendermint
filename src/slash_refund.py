@@ -93,7 +93,7 @@ def calculateRefundAmounts(
         refund_amount = int(pre_slash_delegations[delegation_address]) - int(
             post_slash_delegations[delegation_address]
         )
-        if refund_amount > 10:
+        if refund_amount > 100:
             refund_amounts[delegation_address] = refund_amount
 
     return refund_amounts
