@@ -6,22 +6,6 @@ from subprocess import run
 from time import sleep
 
 
-DELEGATOR_ADDRESSES = [
-    "cosmos1xte2uan9vj0v2va8h42hc82t7ukm3z27hpf3sd",
-    "cosmos1me3hg2l74zn5ag9y879u7re4cp4dxea9l079zz",
-    "cosmos1p64r7emjdsuammvzp4gpf82qustywhy5v7cs35",
-    "cosmos1tyj3ls8w296a2pjn3ysyrjf9v0q0gfjykrewmy",
-    "cosmos1qm9gkn8xrs87z57z4reevevjy4qztkdtmhe5eq",
-    "cosmos1dmht64cp3flrelfumd09zwwr8w32yyxct2exm5",
-    "cosmos1az83k2zgpjx3nszvwrywrez8ypp9fg2yfd3try",
-    "cosmos1cfwagq6xza66ya79s89p28ewqt634y79h7aute",
-    "cosmos16nyml40nxauav5cct0wmm4ve9w86lzg6m8m879",
-    "cosmos16q6u906vehfdnkqwm0w94e5ltth39jyuqsxwmd",
-    "cosmos1jjlsuzhlrdj8p268rs4afwth7k7tfdt5nqpz83",
-    "cosmos1jamdpre44ywhswx8khxnz3fx6a5hsj6jdnxzqs",
-]
-
-
 def getResponse(end_point, query_field=None, query_msg=None):
     response = None
 
@@ -52,86 +36,76 @@ def getSlashBlock(url: str, val_address: str) -> int:
     latest_slash = len(data["result"]["blocks"]) - 1
     return data["result"]["blocks"][latest_slash]["block"]["header"]["height"]
 
-
 def getDelegationAmounts(
-    addresses: str,
-    valoper_address: str,
-    daemon: str,
-    endpoint: str,
-    chain_id: str,
-    block_height: int,
+    daemon: str, endpoint: str, chain_id: str, block_height: int, valoper_address: str
 ):
-    delegation_sums = {}
-    for address in addresses:
-        address, delegation_amount = getDelegationAmount(
-            address,
-            valoper_address,
-            daemon,
-            endpoint,
-            chain_id,
-            int(block_height) - 1,
+    endpoints = [endpoint, "https://rpc-cosmoshub.ecostake.com:443"]
+    delegations = {}
+    page = 1
+    page_limit = 100
+    more_pages = True
+
+    while more_pages:
+        endpoint_choice = (page % len(endpoints)) - 1
+        result = run(
+            f"/home/schultzie/go/bin/{daemon} q staking delegations-to {valoper_address} --height {block_height} --page {page} --output json --limit {page_limit} --node {endpoints[endpoint_choice]} --chain-id {chain_id}",
+            shell=True,
+            capture_output=True,
+            text=True,
         )
-        if address and (address not in delegation_sums):
-            delegation_sums[address] = delegation_amount
-    return delegation_sums
+        if result.returncode == 1:
+            print(endpoints[endpoint_choice])
+            continue
+        response = json.loads(result.stdout)
 
-
-def getDelegationAmount(
-    address: str,
-    valoper_address: str,
-    daemon: str,
-    endpoint: str,
-    chain_id: str,
-    block_height: int,
-):
-    result = run(
-        f"/usr/local/go/bin/{daemon} q staking delegations {address} --height {block_height} --output json --node {endpoint} --chain-id {chain_id}",
-        shell=True,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode == 1:
-        raise ("No delegations returned")
-    response = json.loads(result.stdout)
-
-    for delegation in response["delegation_responses"]:
-        if delegation["delegation"]["validator_address"] == valoper_address:
-            return address, delegation["balance"]["amount"]
-
-    return None, None
-
+        for delegation in response["delegation_responses"]:
+            delegator_address = delegation["delegation"]["delegator_address"]
+            delegation_amount = delegation["balance"]["amount"]
+            if delegator_address not in delegations:
+                delegations[delegator_address] = delegation_amount
+            else:
+                print(delegator_address)
+        page += 1
+        sleep(2)
+        if len(response["delegation_responses"]) < page_limit:
+            more_pages = False
+    
+    return delegations
 
 def calculateRefundAmounts(
     daemon: str, endpoint: str, chain_id: str, slash_block: int, valoper_address: str
 ):
-    pre_slack_block = int(slash_block) - 1
+    pre_slack_block = int(slash_block) - 5
     refund_amounts = {}
-    pre_slash_delegations = getDelegationAmounts(
-        DELEGATOR_ADDRESSES,
-        valoper_address,
-        daemon,
-        endpoint,
-        chain_id,
-        pre_slack_block,
-    )
-    post_slash_delegations = getDelegationAmounts(
-        DELEGATOR_ADDRESSES,
-        valoper_address,
-        daemon,
-        endpoint,
-        chain_id,
-        int(slash_block) + 1,
-    )
+    # pre_slash_delegations = getDelegationAmounts(
+    #     daemon, endpoint, chain_id, pre_slack_block, valoper_address
+    # )
+    
+    # post_slash_delegations = getDelegationAmounts(
+    #     daemon, endpoint, chain_id, slash_block, valoper_address
+    # )
+    
+    pre_slash_delegations = read_json(pre_slack_block)
+    post_slash_delegations = read_json(slash_block)
+
     if len(pre_slash_delegations) != len(post_slash_delegations):
         raise ("Something went awry on delegation calcs")
     for delegation_address in pre_slash_delegations:
-        refund_amounts[delegation_address] = int(
+        refund_amount = int(
             pre_slash_delegations[delegation_address]
         ) - int(post_slash_delegations[delegation_address])
+        if refund_amount > 10:
+            refund_amounts[delegation_address] = refund_amount
 
+    with open("/tmp/refund_amounts.json", "w+") as f:
+        f.write(json.dumps(refund_amounts))
+            
     return refund_amounts
 
-
+def read_json(block_height):
+    with open(f"/tmp/{block_height}.json") as f:
+        return json.load(f)
+        
 def buildRefundJSON(
     refund_amounts: dict, send_address: str, denom: str, memo: str
 ) -> dict:
@@ -237,7 +211,16 @@ def parseArgs():
 
 
 def main():
-    args = parseArgs()
+    # args = parseArgs()
+    # denom = args.denom
+    # daemon = args.daemon
+    # chain_id = args.chain_id
+    # endpoint = args.endpoint
+    # valcons_address = args.valcons_address
+    # valoper_address = args.valoper_address
+    # send_address = args.send_address
+    # memo = args.memo
+    
     denom = "uatom"
     daemon = "gaiad"
     chain_id = "cosmoshub-4"
@@ -248,11 +231,13 @@ def main():
     memo = "With 💜 from Lavender.Five Nodes 🐝"
 
     slash_block = getSlashBlock(endpoint, valcons_address)
+    print(slash_block)
     refund_amounts = calculateRefundAmounts(
         daemon, endpoint, chain_id, slash_block, valoper_address
     )
-    buildRefundScript(refund_amounts, send_address, denom, memo)
+    # buildRefundScript(refund_amounts, send_address, denom, memo)
 
 
 if __name__ == "__main__":
     main()
+# https://colab.research.google.com/github/dcmoura/spyql/blob/master/notebooks/json_benchmark.ipynb
