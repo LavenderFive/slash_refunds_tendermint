@@ -36,13 +36,14 @@ def getSlashBlock(url: str, val_address: str) -> int:
     latest_slash = len(data["result"]["blocks"]) - 1
     return data["result"]["blocks"][latest_slash]["block"]["header"]["height"]
 
+
 def getDelegationAmounts(
     daemon: str, endpoint: str, chain_id: str, block_height: int, valoper_address: str
 ):
-    endpoints = [endpoint, "https://rpc-cosmoshub.ecostake.com:443"]
+    endpoints = [endpoint]
     delegations = {}
     page = 1
-    page_limit = 100
+    page_limit = 200
     more_pages = True
 
     while more_pages:
@@ -67,45 +68,37 @@ def getDelegationAmounts(
                 print(delegator_address)
         page += 1
         sleep(2)
-        if len(response["delegation_responses"]) < page_limit:
+        if len(response["delegation_responses"]) < page_limit < 20:
             more_pages = False
-    
+
     return delegations
+
 
 def calculateRefundAmounts(
     daemon: str, endpoint: str, chain_id: str, slash_block: int, valoper_address: str
 ):
     pre_slack_block = int(slash_block) - 5
     refund_amounts = {}
-    # pre_slash_delegations = getDelegationAmounts(
-    #     daemon, endpoint, chain_id, pre_slack_block, valoper_address
-    # )
-    
-    # post_slash_delegations = getDelegationAmounts(
-    #     daemon, endpoint, chain_id, slash_block, valoper_address
-    # )
-    
-    pre_slash_delegations = read_json(pre_slack_block)
-    post_slash_delegations = read_json(slash_block)
+    pre_slash_delegations = getDelegationAmounts(
+        daemon, endpoint, chain_id, pre_slack_block, valoper_address
+    )
+
+    post_slash_delegations = getDelegationAmounts(
+        daemon, endpoint, chain_id, slash_block, valoper_address
+    )
 
     if len(pre_slash_delegations) != len(post_slash_delegations):
         raise ("Something went awry on delegation calcs")
     for delegation_address in pre_slash_delegations:
-        refund_amount = int(
-            pre_slash_delegations[delegation_address]
-        ) - int(post_slash_delegations[delegation_address])
+        refund_amount = int(pre_slash_delegations[delegation_address]) - int(
+            post_slash_delegations[delegation_address]
+        )
         if refund_amount > 10:
             refund_amounts[delegation_address] = refund_amount
 
-    with open("/tmp/refund_amounts.json", "w+") as f:
-        f.write(json.dumps(refund_amounts))
-            
     return refund_amounts
 
-def read_json(block_height):
-    with open(f"/tmp/{block_height}.json") as f:
-        return json.load(f)
-        
+
 def buildRefundJSON(
     refund_amounts: dict, send_address: str, denom: str, memo: str
 ) -> dict:
@@ -120,7 +113,7 @@ def buildRefundJSON(
         "auth_info": {
             "signer_infos": [],
             "fee": {
-                "amount": [{"denom": denom, "amount": "1000"}],
+                "amount": [{"denom": denom, "amount": "50000"}],
                 "gas_limit": "1500000",
                 "payer": "",
                 "granter": "",
@@ -141,10 +134,51 @@ def buildRefundJSON(
     return data
 
 
-def buildRefundScript(refund_amounts: dict, send_address: str, denom: str, memo: str):
-    refundJson = buildRefundJSON(refund_amounts, send_address, denom, memo)
-    with open("/tmp/dist.json", "w+") as f:
-        f.write(json.dumps(refundJson))
+def buildRefundScript(
+    refund_amounts: dict, send_address: str, denom: str, memo: str
+) -> int:
+    batch_size = 75
+    batch = 0
+    batches = []
+    batched = {}
+    while batch < len(refund_amounts):
+        batched_refund_amounts = {}
+        for x in list(refund_amounts)[batch : batch + batch_size]:
+            batched_refund_amounts[x] = refund_amounts[x]
+        batches.append(batched_refund_amounts)
+        batch += batch_size
+
+    batch = 0
+    for batch_refund in batches:
+        refundJson = buildRefundJSON(batch_refund, send_address, denom, memo)
+        with open(f"/tmp/dist_{batch}.json", "w+") as f:
+            f.write(json.dumps(refundJson))
+        for address in batch_refund:
+            batched[address] = batch_refund[address]
+        batch += 1
+    return batch
+
+
+def issue_refunds(
+    batch_count: int, daemon: str, chain_id: str, keyname: str, node: str
+):
+    i = 0
+    while i < batch_count:
+        result = run(
+            f"/home/schultzie/go/bin/{daemon} tx sign /tmp/dist_{i}.json --from {keyname} -ojson --output-document ~/dist_signed.json --node {node} --chain-id {chain_id} --keyring-backend test",
+            shell=True,
+            capture_output=True,
+            text=True,
+        )
+        sleep(1)
+        result = run(
+            f"/home/schultzie/go/bin/{daemon} tx broadcast ~/dist_signed.json --node {node} --chain-id {chain_id}",
+            shell=True,
+            capture_output=True,
+            text=True,
+        )
+        i += 1
+        sleep(15)
 
 
 def parseArgs():
@@ -205,39 +239,37 @@ def parseArgs():
         "-m",
         "--memo",
         dest="memo",
-        help="Optional. Memo to send in each tx (ex. With 💜 from Lavender.Five Nodes 🐝",
+        help="Optional. Memo to send in each tx (ex. With 💜 from Lavender.Five Nodes 🐝)",
+    )
+    parser.add_argument(
+        "-k",
+        "--keyname",
+        dest="keyname",
+        required=True,
+        help="Wallet to issue refunds from",
     )
     return parser.parse_args()
 
 
 def main():
-    # args = parseArgs()
-    # denom = args.denom
-    # daemon = args.daemon
-    # chain_id = args.chain_id
-    # endpoint = args.endpoint
-    # valcons_address = args.valcons_address
-    # valoper_address = args.valoper_address
-    # send_address = args.send_address
-    # memo = args.memo
-    
-    denom = "uatom"
-    daemon = "gaiad"
-    chain_id = "cosmoshub-4"
-    endpoint = "http://65.21.132.124:10657"
-    valcons_address = "cosmosvalcons1c5e86exd7jsyhcfqdejltdsagjfrvv8xv22368"
-    valoper_address = "cosmosvaloper140l6y2gp3gxvay6qtn70re7z2s0gn57zfd832j"
-    send_address = "cosmos15s9vggt9d0xumzqeq89scy4lku4k6qlzvvv2lz"
-    memo = "With 💜 from Lavender.Five Nodes 🐝"
+    args = parseArgs()
+    denom = args.denom
+    daemon = args.daemon
+    chain_id = args.chain_id
+    endpoint = args.endpoint
+    valcons_address = args.valcons_address
+    valoper_address = args.valoper_address
+    send_address = args.send_address
+    memo = args.memo
+    keyname = args.keyname
 
     slash_block = getSlashBlock(endpoint, valcons_address)
-    print(slash_block)
     refund_amounts = calculateRefundAmounts(
         daemon, endpoint, chain_id, slash_block, valoper_address
     )
-    # buildRefundScript(refund_amounts, send_address, denom, memo)
+    batch_count = buildRefundScript(refund_amounts, send_address, denom, memo)
+    issue_refunds(batch_count, daemon, chain_id, keyname, endpoint)
 
 
 if __name__ == "__main__":
     main()
-# https://colab.research.google.com/github/dcmoura/spyql/blob/master/notebooks/json_benchmark.ipynb
